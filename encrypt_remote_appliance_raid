@@ -1,0 +1,635 @@
+#! /bin/bash
+###########
+#
+# Script to automate encrypting raid on appliance.  Must be run after raid has
+# been formatted, but before you have put much data on it.  
+#
+###########
+
+#Exit if trying to use an unset variable
+#set -o nounset
+#Exit script if one of the commands fails
+#set -o errexit
+
+do_help(){
+    cat << EOL
+This script is to automate encrypting raid on appliance.  Must be run after 
+raid has been formatted, but before you have put much data on it.  
+
+This script requires one or two arguments that specify the CFA and optionally region.  If a region
+is not specified you will be asked to pick one.  
+
+
+The arguments can look like one of these to specify you want cfa1a0.c7:
+$0 1
+   and then pick C7 from the menu
+$0 1 c7
+$0 c7 1
+$0 c7 1.0
+$0 cfa1a0.c7
+$0 cfa1a0.c7.myinfrascale.com
+
+
+EOL
+    exit 0
+}
+
+setup_encryption() {
+$sshlong  <<'EOF'
+if [ $(which systemctl) ] ; then
+    systemctl stop stark.service 
+else
+    service stark stop
+fi
+
+sleep 30
+
+vgchange -a y
+mount /dev/vg0/raid /mnt
+cd /mnt
+/bin/rm /mnt/..:rvx-reserved:..
+tar cf /tmp/raid.tar .
+cd /
+umount /mnt
+
+mkdir -p /cfg/var/private
+dd if=/dev/urandom of=/cfg/var/private/secure-raid.key count=2
+chmod 400 /cfg/var/private/secure-raid.key
+echo YES|cryptsetup --key-file=/cfg/var/private/secure-raid.key luksFormat /dev/vg0/raid
+cryptsetup --key-file=/cfg/var/private/secure-raid.key luksOpen /dev/vg0/raid secure-raid
+mkfs.xfs -f -l internal,size=128m,version=2 /dev/mapper/secure-raid
+sed -i -e 's/vg0-raid/secure-raid/' /etc/fstab
+
+mount /raid
+cd /raid
+tar xf /tmp/raid.tar
+
+printf 'secure-raid\t/dev/mapper/vg0-raid\t/cfg/var/private/secure-raid.key\tluks\n' > /etc/crypttab
+sync
+sleep 5
+echo "ready"
+EOF
+}
+
+is_raid_encrypted_already() {
+    results="x$($ssh grep "raid[^/]" /etc/fstab | grep -o secure-raid )" || true
+    if [ ! "${results}" == x ] 
+    then
+	die "Looks like the raid is already encrypted"
+    fi
+}
+
+was_noraid_selected_in_grub() {
+    results="x$($ssh cat /proc/cmdline | grep NORAID )"
+    if [ "$(echo $results | grep -o NORAID )" == "NORAID" ]
+    then
+	echo "yes"
+    else
+	echo "no"
+    fi
+}
+
+is_raid_mounted() {
+    results="x$($ssh mount | grep "/raid ")" || true
+    if [ "${results}" == x ] 
+    then
+	if [ "$(was_noraid_selected_in_grub)" == "yes" ]
+	then
+	    echo "Looks like the raid isn't mounted, because we booted to noraid"
+	else
+	    die "Looks like the raid isn't mounted, but not because we booted to noraid.  Probably hasn't been provisioned yet"
+	fi	
+    else
+	dprint "Looks like the raid is mounted"
+    fi   
+}
+
+is_raid_too_full() {
+    if [ "$(was_noraid_selected_in_grub)" == "no" ]
+    then
+	results="$($ssh df -P /raid | tail -n 1 | awk '{print $3}')" || true
+	if [[ $override_size == no ]] ; then
+	    if [ "${results}" -gt $raid_used_max ] 
+	    then
+		die "Looks like the raid has too much data already"
+	    fi
+	else
+	    echo_red "Size check disabled, if there's more data than will fit temporary storage, this machine will be broken."
+	fi
+    fi
+}
+
+can_ssh() {
+    if [ "$($ssh echo "success")" == "success" ] 
+    then
+	dprint "ssh as root seems to work"
+	user=root
+    else
+	die "ssh as root didn't work.  You probably need to run push_auth first."
+    fi
+}
+
+is_car_complete() {
+    looptime=120   
+    results=$($ssh "if [ -d /raid/:car:/FZZ ] ; then echo "yes" ; else echo "no" ; fi")
+    if [ "$results" == "no" ] ; then 	
+	endtime=$(expr $(date +%s) + $looptime)	
+	while true; do
+	    results=$($ssh "if [ -d /raid/:car:/FZZ ] ; then echo "yes" ; else echo "no" ; fi")
+	    if [ "$results" == "yes" ] ; then
+		dprint "ucar appears to be complete"
+		good=yes
+		break
+	    else
+		dprint "ucar isn't complete yet"
+	    fi
+	    
+	    if [ $(date +%s) -gt $endtime ] ; then
+		die "Timed out waiting for ucar"
+	    fi
+	sleep 1
+	done
+	sleep 20 #Give it time to get everything setup and synced.  
+    else
+	dprint "ucar appears to be complete already, good."
+    fi
+}
+
+is_virtual() {
+    # For the intended use, there won't be virtual appliances
+    # and for testing we want virtual to work
+    return
+    
+    results="x$($ssh dmidecode -s system-manufacturer | tail -n 1 )" || true
+    case $results in
+	xVMware*)
+	    die "Looks like this vpc is a vmware VM.  We don't encrypt these.  Just go on to the next step."
+	    ;;
+	xSupermicro*)
+	    dprint "Looks good, system is hardware."
+	    ;;
+	xInfras*)
+	    dprint "Looks good, system is hardware."
+	    ;;
+	*)
+	    die "System DMI isn't Supermicro or vmware, this script would probably not work.  Taking the cowards way out."
+	    ;;
+    esac
+}
+
+safety_check() {
+    dprint "Can we SSH?"
+    can_ssh
+    dprint "Is this virtual?"
+    is_virtual
+    dprint "Is the raid already encrypted?"
+    is_raid_encrypted_already
+    dprint "is the raid mounted?"
+    is_raid_mounted
+}
+
+safety_check_mounted() {
+    dprint "does the raid contain too much data?"
+    is_raid_too_full
+    dprint "is car complete?"
+    is_car_complete
+}
+
+dprint() {
+    if [ "$DEBUG" == "true" ] 
+    then 
+	echo "$*" 
+    fi 
+}
+
+print_green () {
+#    blue_text='\E[32m'
+    echo -en '\E[32m'
+}
+
+print_red () {
+#    red_text='\E[31m'
+    echo -en '\E[31m'
+}
+
+print_normal () {
+    tput sgr0
+}
+
+echo_red() {
+    print_red
+    echo "$1"
+    print_normal
+}
+
+echo_green() {
+    print_green
+    echo "$1"
+    print_normal
+}
+
+die() {
+    echo_red "$*" 1>&2
+    exit 1
+}
+
+reboot_to_noraid_grub1() {
+    echo "Appliance should now reboot to NORAID"
+    $sshlong << 'EOF'
+#sudo su -
+if [ -d /boot ] && [ ! -L /boot ] ; then
+    sudo mount /boot -o remount,rw
+    grubconf="/boot/grub/grub.conf"
+else
+    if [ -b /dev/rvx-boot ] ; then
+        sudo umount /dev/rvx-boot
+	mkdir /tmp/mnt
+	sudo mount /dev/rvx-boot /tmp/mnt
+	grubconf="/tmp/mnt/grub/grub.conf"
+    else
+        if [ -d /flash/boot ] && [ ! -L /flash/boot ] ; then
+	    sudo mount /flash -o remount,rw
+	    grubconf="/flash/boot/grub/grub.conf"
+        else
+	    echo "Can't figure out how to get to noraid"
+        fi
+    fi
+fi
+count=0
+count=$(grep title $grubconf | while read line ; do
+   if [ "$(echo ${line} | grep -o NORAID)" == "NORAID" ] 
+       then
+           echo $count
+       fi
+       count=$(expr $count + 1)
+    done 
+)
+sudo sed -i "s/default=./default=${count}/g" "$grubconf"
+menulst="$(dirname $grubconf)/menu.lst"
+sudo cp "$grubconf" "$menulst"
+sudo reboot
+EOF
+}
+
+reboot_to_noraid_blscfg() {
+    $sshlong << 'EOF'
+grub2-set-default "$(grep title /boot/loader/entries/noraid.conf | cut -d " " -f 2-)"
+sync
+reboot
+EOF
+}
+
+reboot_to_noraid() {
+    results="$($ssh 'test -d /boot/loader/entries/ && echo "blscfg" || echo "grub1" ')"
+    # blscfg is the needlessly complicated "boot loader spec config" used by our grub2 config
+    # https://systemd.io/BOOT_LOADER_SPECIFICATION/
+    case $results in
+	blscfg)
+	    reboot_to_noraid_blscfg
+	;;
+	grub1)
+	    reboot_to_noraid_grub1
+	;;
+	*)
+	    die "It seems we failed to figure out if the remote machine uses grub1 or 2"
+	    ;;
+    esac
+}
+
+reboot_to_normal_grub1() {
+    echo "Appliance should now reboot to Normal"
+    $ssh sync
+    $ssh << 'EOF'
+sudo su -
+if [ -d /boot ] && [ ! -L /boot ] ; then
+    mount /boot -o remount,rw
+    grubconf="/boot/grub/grub.conf"
+else
+    if [ -b /dev/rvx-boot ] ; then
+        umount /dev/rvx-boot
+	mkdir /tmp/mnt
+	mount /dev/rvx-boot /tmp/mnt
+	grubconf="/tmp/mnt/grub/grub.conf"
+    else
+        if [ -d /flash/boot ] && [ ! -L /flash/boot ] ; then
+	    mount /flash -o remount,rw
+	    grubconf="/flash/boot/grub/grub.conf"
+        else
+	    echo "Can't figure out how to get to normal boot"
+        fi
+    fi
+fi
+sed -i "s/default=./default=0/g" "$grubconf"
+menulst="$(dirname $grubconf)/menu.lst"
+cp "$grubconf" "$menulst"
+reboot
+EOF
+}
+
+reboot_to_normal_blscfg() {
+        $sshlong << 'EOF'
+grub2-set-default "$(grep title /boot/loader/entries/normal.conf | cut -d " " -f 2- )"
+sync
+reboot
+EOF
+}
+
+reboot_to_normal() {
+    results="$($ssh 'test -d /boot/loader/entries/ && echo "blscfg" || echo "grub1" ')"
+    # blscfg is the needlessly complicated "boot loader spec config" used by our grub2 config
+    # https://systemd.io/BOOT_LOADER_SPECIFICATION/
+
+    # Came up empty, not sure why, but if it happens again, give it a moment and then try again
+    if [[ $results == "" ]] ; then
+	echo "   it happened again, just a moment"
+	sleep 10
+	results="$($ssh 'test -d /boot/loader/entries/ && echo "blscfg" || echo "grub1" ')"
+    fi
+    
+    case $results in
+	blscfg)
+	    reboot_to_normal_blscfg
+	;;
+	grub1)
+	    reboot_to_normal_grub1
+	;;
+	*)
+	    die "It seems we failed to figure out if the remote machine uses grub1 or 2"
+	    ;;
+    esac
+}
+
+can_ping() {
+    ${ping} -c 1 -W 1 "$IP" > /dev/null || die "No ping reply"
+}
+
+wait_for_ping() {
+    looptime=600
+    endtime=$(expr $(date +%s) + $looptime)
+    while true; do
+	sleep 1
+	${ping} -c 1 -W 2 "$IP" > /dev/null && break
+	if [ $(date +%s) -gt $endtime ] ; then
+	    die "Timed out waiting for ping"
+	fi
+    done
+}
+
+wait_for_no_ping() {
+    looptime=600
+    endtime=$(expr $(date +%s) + $looptime)
+    while true; do
+	sleep 1
+	${ping} -c 1 -W 2 "$IP" > /dev/null || break
+	if [ $(date +%s) -gt $endtime ] ; then
+	    die "Timed out waiting for ping to stop responding"
+	fi
+    done
+}
+
+wait_for_ssh() {
+    looptime=300
+    endtime=$(expr $(date +%s) + $looptime)
+
+    while true; do
+	if [ "$($ssh echo "success")" == "success" ] 
+	then
+	    echo "SSH working"
+	    break
+	else
+	    sleep 1
+	fi
+	
+	if [ $(date +%s) -gt $endtime ] ; then
+	    die "Timed out waiting for ssh"
+	fi
+
+    done
+}
+
+check_raid() {
+    $ssh <<EOF
+    sudo mdadm --assemble --scan > /dev/null 2>&1
+    sudo vgscan > /dev/null 2>&1
+EOF
+    # Old cloud appliances would sometimes fail to detect the raidcard randomly on some boots
+    # Long since fixed, so this check really isn't needed anymore.  Return to exit the
+    # function early.
+    return
+
+    
+    if [ "$($ssh sudo tw_cli show | head -n 6 | grep -o c0)" == "c0" ] ; then
+	raid=yes
+	raidtype=3ware
+    elif [ "$($ssh 'sudo storcli show | grep "Number of Controllers" | grep -o "[0-9]*"')" == "1" ] ; then
+	raid=yes
+	raidtype=lsi
+    elif [[ "$($ssh 'sudo vgdisplay | grep -o "vg0"' )x" == "vg0x" ]] ; then
+	raid=yes
+	#raidtype=md
+	raidtype=software
+    else
+	raid=no
+	raidtype=unknown
+    fi
+    
+    if [ "$raid" == "yes" ]
+    then
+	dprint "$raidtype raid card detected this boot"
+    else
+	echo_red "raid card wasn't detected.  "
+	die "I hate these raid card problems"
+    fi
+}
+
+fix_root_keys(){
+  $ssh << 'EOF'
+ sudo mkdir -p /root/.ssh
+ sudo cp -rp /cfg/users/infrascale/.ssh /root/.ssh
+ sudo chown -R 0:0 /root/.ssh
+EOF
+}
+
+wait_for_reboot(){
+    sleep 10
+    
+    echo_green "Waiting for ping to stop"
+    wait_for_no_ping
+
+    echo_green "waiting for ping reply"
+    wait_for_ping
+
+    echo_green "waiting for SSH"
+    wait_for_ssh
+}
+
+
+#MAIN
+DEBUG=false
+
+
+#Parse arguments
+n=none
+region_selection=none
+override_size=no
+
+for option in "$@"
+do
+    case $option in
+	--force-size)
+	    echo_red "Overriding the size check can be dangerous.  If there is more data than will fit in the temp"
+	    echo_red " storage data will be lost.  "
+	    echo "To continue with override, type dangerous in all caps"
+	    read yesno
+	    if [[ $yesno != DANGEROUS ]] ; then
+		die "Canceling run"
+	    fi	   
+	    override_size=yes
+	    ;;
+	help|-h*)
+	    do_help
+	    exit 0
+	    ;;
+	c7|us|rsuk|rs|rapid*|uk|ca*|peer*|p1|slc*|sand*)
+	    die "This script has been modified to expect direct SSH access."
+	    ;;
+	*)
+	    # If the argument is only a number
+	    if [ "x$option" == "x$(echo "$option" | grep -o '[0-9\.]*')" ] ; then
+		if [ "$n" == 'none' ] ; then
+		    n="$option"
+		else
+		    die "Tried to specify more than one appliance? Sorry it doesn't work that way"
+		fi
+	    else
+		die "unrecognized option $option"
+		exit 1	    
+	    fi
+	    ;;
+    esac
+done
+
+if [ "$n" == 'none' ] ; then
+    echo_red "No appliance specified."
+    do_help
+    exit 1
+fi
+
+
+# if [[ "$n" =~ \. ]] ; then
+#     add_to_ip="$( echo $n | cut -d . -f 2 )"
+#     n="$( echo $n | cut -d . -f 1 )"
+# else
+#     if [[ "$n" =~ a ]] ; then
+# 	add_to_ip="$( echo $n | cut -d a -f 2 )"
+# 	n="$( echo $n | cut -d a -f 1 )"
+#     else
+# 	add_to_ip=0
+#     fi
+# fi
+
+# cust=$n
+
+
+set +o nounset
+# find the globals in a way that works with bash -x
+us="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )"
+#source "${us}/globals"
+#us=${0%/*}
+#. $us/globals
+set -o nounset
+
+
+#vpc=vpc$n
+
+#IP=$PRIV_BASE.$o3.$apo4 
+
+IP="$n"
+
+echo "Going to encrypt raid on appliance at $IP"
+
+
+#ssh_no_pass="-o PasswordAuthentication=no "
+ssh_opts="-o ControlPath=~/.ssh/cm-%r@%h:%p -o ControlPersist=30s -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -q -x root@${IP} "
+# ssh like above, but as infrascale user
+ssh_opts_inf="-o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -q -x infrascale@${IP} "
+raid_used_max=120000000
+root_pw=rvxd2d2d
+
+sshpass="$(which sshpass)"
+
+if [[ $sshpass == "" ]] ; then
+    ssh="$(which ssh)"
+else
+    ssh="$sshpass -p $root_pw $(which ssh)"
+fi
+   
+#How many seconds to wait before giving up on ssh connections
+timeout=20
+long_timeout=240
+if [ -x "$(which timeout)" ] ; then
+    ping="timeout 2 ping "
+    sshroot="timeout -k $timeout $timeout $ssh $ssh_opts"
+    sshlong="timeout -k ${long_timeout} ${long_timeout} $ssh $ssh_opts"
+    sshinf="timeout -k $timeout $timeout $ssh $ssh_opts_inf"
+    #sshroot="timeout $timeout ssh $ssh_opts"
+    #sshinf="timeout $timeout ssh $ssh_opts_inf"
+else
+    ping="ping"
+    sshroot="$ssh $ssh_opts"
+    sshinf="$ssh $ssh_opts_inf"
+fi
+
+ssh="$sshroot"
+
+can_ping "$IP"
+
+safety_check
+
+echo_green "Looks like we are ready"
+
+if [ "$(was_noraid_selected_in_grub)" == "no" ] ; then
+    safety_check_mounted    
+    echo_green "rebooting to NORAID mode"
+    reboot_to_noraid
+
+    wait_for_reboot
+
+    # Doesn't apply in this case
+    #fix_root_keys
+
+    echo_green "check for raid card"
+    check_raid
+
+    #echo_green "verify we are in noraid mode"
+    if [ "$(was_noraid_selected_in_grub)" == "no" ] ; then
+	die "Something is wrong.  We tried to boot to noraid, but failed somehow"
+    else
+	echo_green "Yep, really in noraid mode"
+    fi
+fi
+
+
+
+echo_green "enabling encryption"
+
+setup_encryption
+
+echo_green "reboot to normal mode"
+
+reboot_to_normal
+
+wait_for_reboot
+
+#echo_green "verify we aren't in noraid mode anymore"
+if [ "$(was_noraid_selected_in_grub)" == "yes" ] ; then
+    die "Something is wrong.  We tried to boot out of noraid, but failed somehow"
+else
+    echo_green "Yep, really in nomal boot"
+fi
+
+echo_green "check for raid card"
+check_raid
+
+echo_green "Success on $IP"
+exit 0
